@@ -363,6 +363,92 @@ def test_noise_robustness(model, tokenizer, baseline_bpb, time_budget):
 
 
 # ---------------------------------------------------------------------------
+# Test 5: Adversarial token search (gradient-free worst-case input)
+# ---------------------------------------------------------------------------
+
+def test_adversarial_search(model, tokenizer, baseline_bpb, time_budget):
+    """
+    Gradient-free search for the worst-case input sequence.
+    Starts from real validation sequences (not random tokens) and iteratively
+    mutates them to maximize per-sequence BPB. Uses a simple evolutionary
+    strategy: keep mutations that increase loss.
+
+    This finds the model's absolute worst case on semi-natural inputs.
+    """
+    t0 = time.time()
+    val_loader = make_dataloader(tokenizer, 8, MAX_SEQ_LEN, "val")
+    token_bytes = get_token_bytes()
+    vocab_size = tokenizer.get_vocab_size()
+
+    # Seed with real validation sequences
+    x_seed, y_seed, _ = next(val_loader)
+    mx.eval(x_seed, y_seed)
+
+    best_bpb = 0.0
+    best_description = ""
+    generations = 0
+
+    # Evolve each sequence independently
+    candidates = []
+    for i in range(x_seed.shape[0]):
+        seq = x_seed[i:i+1]  # (1, seq_len)
+        tgt = y_seed[i:i+1]
+        loss = model(seq, tgt, reduction="none").reshape(-1)
+        nb = mx.take(token_bytes, tgt.reshape(-1), axis=0)
+        mask = nb > 0
+        nats = mx.sum(loss * mask).item()
+        nbytes = int(mx.sum(nb).item())
+        mx.eval()
+        bpb = nats / (math.log(2) * nbytes) if nbytes > 0 else 0.0
+        candidates.append((np.array(seq.reshape(-1)), bpb))
+
+    while time.time() - t0 < time_budget:
+        for idx in range(len(candidates)):
+            if time.time() - t0 >= time_budget:
+                break
+
+            seq_np, current_bpb = candidates[idx]
+
+            # Mutate: replace 5-10% of tokens with random ones
+            mutation_rate = 0.05 + 0.05 * np.random.random()
+            mutant = seq_np.copy()
+            n_mutations = max(1, int(len(mutant) * mutation_rate))
+            positions = np.random.choice(len(mutant), n_mutations, replace=False)
+            mutant[positions] = np.random.randint(4, vocab_size, size=n_mutations)
+
+            # Evaluate mutant
+            seq_mx = mx.array(mutant.reshape(1, -1), dtype=mx.int32)
+            # Build targets by shifting
+            inputs = seq_mx[:, :-1]
+            targets = seq_mx[:, 1:]
+            loss = model(inputs, targets, reduction="none").reshape(-1)
+            nb = mx.take(token_bytes, targets.reshape(-1), axis=0)
+            mask = nb > 0
+            nats = mx.sum(loss * mask).item()
+            nbytes = int(mx.sum(nb).item())
+            mx.eval()
+
+            if nbytes > 0:
+                mutant_bpb = nats / (math.log(2) * nbytes)
+                if mutant_bpb > current_bpb:
+                    candidates[idx] = (mutant, mutant_bpb)
+
+        generations += 1
+
+    # Find the worst across all candidates
+    best_seq, best_bpb = max(candidates, key=lambda c: c[1])
+
+    return TestResult(
+        test_name="adversarial_search",
+        adversarial_bpb=best_bpb,
+        baseline_bpb=baseline_bpb,
+        robustness_gap=best_bpb - baseline_bpb,
+        description=f"worst_found={best_bpb:.3f} generations={generations} candidates={len(candidates)}",
+        num_tokens_tested=generations * len(candidates) * MAX_SEQ_LEN,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -373,6 +459,7 @@ def run_all_tests(model, tokenizer, baseline_bpb, time_budget):
         test_subgroup_disparity,
         test_window_boundary_exploit,
         test_noise_robustness,
+        test_adversarial_search,
     ]
     per_test_budget = time_budget / len(tests)
     results = []
