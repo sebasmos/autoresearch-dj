@@ -402,58 +402,61 @@ def test_adversarial_search(model, tokenizer, baseline_bpb, time_budget):
     while time.time() - t0 < time_budget:
         # Sort by BPB descending — focus effort on most promising candidates
         candidates.sort(key=lambda c: c[1], reverse=True)
-        # Focus on top half
         active = min(len(candidates), 8)
 
+        # Batch all mutations together for a single forward pass
+        mutants = []
+        mutant_indices = []
         for idx in range(active):
-            if time.time() - t0 >= time_budget:
-                break
-
             seq_np, current_bpb = candidates[idx]
-
-            # Adaptive mutation rate: higher for lower-BPB candidates
-            base_rate = 0.02 + 0.18 * (1.0 - idx / active)  # 2-20%
+            base_rate = 0.02 + 0.18 * (1.0 - idx / active)
             mutant = seq_np.copy()
             n_mutations = max(1, int(len(mutant) * base_rate))
             positions = np.random.choice(len(mutant), n_mutations, replace=False)
             mutant[positions] = np.random.randint(4, vocab_size, size=n_mutations)
+            mutants.append(mutant)
+            mutant_indices.append(idx)
 
-            # Evaluate mutant
-            seq_mx = mx.array(mutant.reshape(1, -1), dtype=mx.int32)
-            inputs = seq_mx[:, :-1]
-            targets = seq_mx[:, 1:]
-            loss = model(inputs, targets, reduction="none").reshape(-1)
-            nb = mx.take(token_bytes, targets.reshape(-1), axis=0)
+        # Add crossover children
+        if len(candidates) >= 2:
+            for _ in range(min(4, active)):
+                i, j = np.random.choice(min(active, len(candidates)), 2, replace=False)
+                parent_a = candidates[i][0]
+                parent_b = candidates[j][0]
+                cp = np.random.randint(len(parent_a) // 4, 3 * len(parent_a) // 4)
+                child = np.concatenate([parent_a[:cp], parent_b[cp:]])
+                mutants.append(child)
+                mutant_indices.append(-1)  # crossover child
+
+        if not mutants:
+            break
+
+        # Batch forward pass
+        batch = mx.array(np.stack(mutants), dtype=mx.int32)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:]
+        loss = model(inputs, targets, reduction="none")  # (batch, seq_len)
+        mx.eval(loss)
+
+        # Evaluate each
+        for k in range(len(mutants)):
+            loss_k = loss[k].reshape(-1)
+            tgt_k = targets[k].reshape(-1)
+            nb = mx.take(token_bytes, tgt_k, axis=0)
             mask = nb > 0
-            nats = mx.sum(loss * mask).item()
+            nats = mx.sum(loss_k * mask).item()
             nbytes = int(mx.sum(nb).item())
-            mx.eval()
-
             if nbytes > 0:
                 mutant_bpb = nats / (math.log(2) * nbytes)
-                if mutant_bpb > current_bpb:
-                    candidates[idx] = (mutant, mutant_bpb)
-
-        # Crossover: combine top 2 candidates
-        if len(candidates) >= 2 and time.time() - t0 < time_budget:
-            parent_a = candidates[0][0]
-            parent_b = candidates[1][0]
-            crossover_point = np.random.randint(len(parent_a) // 4, 3 * len(parent_a) // 4)
-            child = np.concatenate([parent_a[:crossover_point], parent_b[crossover_point:]])
-            seq_mx = mx.array(child.reshape(1, -1), dtype=mx.int32)
-            inputs = seq_mx[:, :-1]
-            targets = seq_mx[:, 1:]
-            loss = model(inputs, targets, reduction="none").reshape(-1)
-            nb = mx.take(token_bytes, targets.reshape(-1), axis=0)
-            mask = nb > 0
-            nats = mx.sum(loss * mask).item()
-            nbytes = int(mx.sum(nb).item())
-            mx.eval()
-            if nbytes > 0:
-                child_bpb = nats / (math.log(2) * nbytes)
-                # Replace worst candidate if child is better
-                if child_bpb > candidates[-1][1]:
-                    candidates[-1] = (child, child_bpb)
+                idx = mutant_indices[k]
+                if idx >= 0:
+                    # Mutation — replace if better
+                    if mutant_bpb > candidates[idx][1]:
+                        candidates[idx] = (mutants[k], mutant_bpb)
+                else:
+                    # Crossover child — replace worst if better
+                    if mutant_bpb > candidates[-1][1]:
+                        candidates[-1] = (mutants[k], mutant_bpb)
 
         generations += 1
 
