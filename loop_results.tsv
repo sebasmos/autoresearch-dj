@@ -1,1 +1,3 @@
 commit	val_bpb	robustness_gap	worst_case_bpb	worst_test	memory_gb	status	description
+5022ead	2.013867	1.549741	3.563608	adversarial_search	20.7	keep	baseline — depth=4, 11.5M params
+1406bb5	2.613756	0.000000	0.000000	skipped	23.2	discard	depth 4->6 — val_bpb regressed 2.014->2.614, too few steps in 5min budget
